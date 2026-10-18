@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 (2026-10-18)
+
+- When you quit Sublime in ambient mode, the music no longer stops where
+  the bar ends. It carries on a little longer and fades out.
+
 ## 0.2.2 (2026-10-15)
 
 - On Windows, listing a project’s files with git and checking whether code
