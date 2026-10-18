@@ -123,19 +123,21 @@ class FileTest(unittest.TestCase):
             with wave.open(path) as w:
                 self.assertEqual(w.readframes(2), b'\x00\x00\xff\x3f\xff\x7f\x01\xc0')
 
-    def test_fade_file_carries_on_then_fades_away(self):
+    def test_fade_file_waits_for_its_turn_then_fades_away(self):
         with tempfile.TemporaryDirectory() as directory:
-            seconds, bar = music.bar_file(LIBRARY, SHEET, 0, 2, 0.3, directory)
+            _, bar = music.bar_file(LIBRARY, SHEET, 0, 2, 0.3, directory)
             path = os.path.join(directory, 'fade.wav')
-            music.fade_file([(-0.5, bar), (seconds - 0.5, bar),
-                             (0.0, os.path.join(directory, 'gone.wav'))], 3.0, 1.0, path)
+            music.fade_file(bar, 0.5, 0.25, 1.0, path)
             with wave.open(path) as w:
-                self.assertEqual(w.getnframes(), 3 * music.RATE)
-                frames = w.readframes(w.getnframes())
-            pcm = array('h', frames)
-            loudest = max(map(abs, pcm[:2 * music.RATE]))
-            self.assertGreater(loudest, 0)
-            self.assertEqual(max(map(abs, pcm[-200:])), 0)  # faded all the way out
+                self.assertEqual(w.getnframes(), int(1.75 * music.RATE))
+                pcm = array('h', w.readframes(w.getnframes()))
+            half = music.RATE  # stereo frames in half a second
+            self.assertEqual(max(map(abs, pcm[:half])), 0)  # silent until the bar is due
+            self.assertGreater(max(map(abs, pcm[half:])), 0)
+            self.assertLess(max(map(abs, pcm[-200:])), 50)  # faded all the way out
+            music.fade_file(bar, -0.5, 0.25, 1.0, path)  # already under way
+            with wave.open(path) as w:
+                self.assertEqual(w.getnframes(), int(0.75 * music.RATE))
 
 
 if __name__ == '__main__':

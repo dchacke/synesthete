@@ -52,16 +52,15 @@ class Player:
             self._processes.append(process)
 
     def finish(self, path):
-        """Play `path` in place of everything else, and nothing after it. It
-        plays on in a session of its own after Sublime has quit. On Windows
-        sounds end with Sublime, so this only keeps new ones from starting."""
+        """Play `path`, and nothing after it. Like the sounds already playing,
+        it plays on after Sublime has quit. On Windows sounds end with
+        Sublime, so this only keeps new ones from starting."""
         self._finished = True
         if sys.platform == 'win32' or self._command is None:
             return
         subprocess.Popen(
             self._command + [path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
-        self.stop()
 
     def stop(self):
         if sys.platform == 'win32':

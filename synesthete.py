@@ -37,7 +37,7 @@ PANEL = 'synesthete'
 SOUND_VERSION = 3  # bump when the music changes, so stale renders are dropped
 ACCENT_GAP = 0.12  # seconds between accents, so a burst of changes cascades
 EARLY_BAR_GAP = 0.8  # when the stage changes, wait at least this long after the last bar
-FADE_HOLD, FADE_SECONDS = 1.5, 4.5  # after quitting, the music carries on this long, then fades out
+FADE_HOLD, FADE_SECONDS = 1.5, 3.0  # after quitting, the music carries on this long, then fades out
 BRANCHES = ('keyword.control.conditional, keyword.control.loop, '
             'keyword.control.exception.catch, keyword.operator.logical')
 NOT_DECISIONS = {'else', 'in', 'is', 'not', '!', 'of', 'then', 'do'}  # see decisions()
@@ -638,8 +638,9 @@ class Band(threading.Thread):
         self.stopped = threading.Event()
         self.woken = threading.Event()
         self.cursor = 0
-        self.sounding = deque(maxlen=2)  # (when, path) of the latest bars started, still ringing
         self.upcoming = None  # (when, path) of the bar rendered next
+        self.rendered = threading.Event()  # clear while the next bar renders
+        self.rendered.set()
         self.fade_path = os.path.join(cache_dir(), 'fade.wav')
 
     def stop(self):
@@ -648,19 +649,19 @@ class Band(threading.Thread):
         self.player.stop()
 
     def fade_out(self):
-        """Sublime is quitting: carry on a little while after it's gone,
-        fading away, rather than stopping wherever the bar ends."""
+        """Sublime is quitting: rather than stopping wherever the bar ends,
+        let it play out and the next one carry on, fading away. Nothing is
+        cut off, so there's no break."""
         self.stopped.set()
         self.woken.set()
-        now = time.monotonic()
-        parts = list(self.sounding)
-        if self.upcoming and self.upcoming[0] > now:  # else it never started
-            parts.append(self.upcoming)
-        if not parts:
+        self.rendered.wait(1.0)
+        if self.upcoming is None:
             return
+        when, path = self.upcoming
+        start = when - time.monotonic()
         try:
-            music.fade_file([(when - now, path) for when, path in parts],
-                            FADE_SECONDS, FADE_HOLD, self.fade_path)
+            music.fade_file(path, start, max(0.0, FADE_HOLD - start), FADE_SECONDS,
+                            self.fade_path)
             self.player.finish(self.fade_path)
         except Exception as e:
             print('Synesthete:', e)  # the API is gone, so no status message
@@ -696,15 +697,17 @@ class Band(threading.Thread):
                     continue  # the code changed while the bar was rendering
                 self.player.play(ready[2])
                 started, seconds = time.monotonic(), ready[1]
-                self.sounding.append((started, ready[2]))
                 self.upcoming = None
+                self.rendered.clear()
                 self.cursor = plan[1] + music.STEPS
                 upcoming = self.next_bar()
                 ready = (upcoming,) + self.conductor.bar(*upcoming)
                 self.upcoming = (started + seconds, ready[2])
+                self.rendered.set()
             except Exception as e:
                 report_failure(e)
                 ready = None
+                self.rendered.set()
                 self.stopped.wait(30)
                 continue
             remaining = started + seconds - time.monotonic()
