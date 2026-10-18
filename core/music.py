@@ -328,6 +328,36 @@ def accent_file(library, index, direction, volume, directory, lines=()):
     return path
 
 
+def fade_file(parts, seconds, hold, path):
+    """Mix the WAVs in `parts`, (seconds from now each starts, path), from now
+    on for `seconds`, full for `hold` seconds and then fading away, into a WAV
+    at `path`."""
+    frames = int(seconds * RATE)
+    out = [0.0] * (2 * frames)
+    for start, source in parts:
+        try:
+            with open(source, 'rb') as f:
+                data = f.read()[44:]  # past the header write_wav wrote
+        except OSError:
+            continue
+        pcm = array('h')
+        pcm.frombytes(data[:len(data) // 2 * 2])
+        if sys.byteorder == 'big':
+            pcm.byteswap()
+        begin = int(round(start * RATE))
+        offset = 2 * begin
+        for i in range(2 * max(0, begin), 2 * min(frames, begin + len(pcm) // 2)):
+            out[i] += pcm[i - offset]
+    held = int(hold * RATE)
+    fading = max(1, frames - held)
+    scale = 1 / 32767
+    for k in range(frames):
+        gain = scale * (1 - max(0, k - held) / fading) ** 2
+        out[2 * k] = min(max(out[2 * k] * gain, -1.0), 1.0)
+        out[2 * k + 1] = min(max(out[2 * k + 1] * gain, -1.0), 1.0)
+    write_wav(path, out[0::2], out[1::2])
+
+
 def write_wav(path, left, right, volume=1.0):
     """Write 16-bit stereo PCM atomically, so a player never sees half a file."""
     scale = 32767 * min(max(volume, 0.0), 1.0)

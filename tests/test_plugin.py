@@ -361,6 +361,22 @@ class PluginTest(unittest.TestCase):
         band.cursor = 8
         self.assertEqual(band.next_bar()[:2], (['a1', 'a2'], 0))  # and around again
 
+    def test_quitting_fades_out_what_the_band_is_playing(self):
+        band = self.plugin.Band(self.conductor)
+        self.conductor.band = band
+        now = time.monotonic()
+        band.sounding.extend([(now - 9, 'old.wav'), (now - 1, 'now.wav')])
+        band.upcoming = (now + 2, 'next.wav')
+        band.player = mock.Mock()
+        with mock.patch.object(self.plugin.music, 'fade_file') as fade_file:
+            self.plugin.SynestheteListener().on_exit()
+        parts = fade_file.call_args[0][0]
+        self.assertEqual([path for _, path in parts], ['old.wav', 'now.wav', 'next.wav'])
+        self.assertAlmostEqual(parts[1][0], -1, places=1)
+        band.player.finish.assert_called_once_with(band.fade_path)
+        self.assertTrue(band.stopped.is_set())
+        self.conductor.band = None
+
     def test_file_mode_goes_back_to_the_top(self):
         view = View('a = 1\n')
         self.conductor.listen(view)

@@ -28,10 +28,13 @@ class Player:
         self._command = command()
         self._processes = []
         self._lock = threading.Lock()
+        self._finished = False
 
     def play(self, path, solo=False):
         """Play `path` in the background. With `solo`, silence everything
         else first."""
+        if self._finished:
+            return
         if solo:
             self.stop()
         if sys.platform == 'win32':
@@ -47,6 +50,18 @@ class Player:
         with self._lock:
             self._processes = [p for p in self._processes if p.poll() is None]
             self._processes.append(process)
+
+    def finish(self, path):
+        """Play `path` in place of everything else, and nothing after it. It
+        plays on in a session of its own after Sublime has quit. On Windows
+        sounds end with Sublime, so this only keeps new ones from starting."""
+        self._finished = True
+        if sys.platform == 'win32' or self._command is None:
+            return
+        subprocess.Popen(
+            self._command + [path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        self.stop()
 
     def stop(self):
         if sys.platform == 'win32':

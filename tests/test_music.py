@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 import wave
+from array import array
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -121,6 +122,20 @@ class FileTest(unittest.TestCase):
             music.write_wav(path, [0.0, 1.0], [0.5, -0.5], volume=1.0)
             with wave.open(path) as w:
                 self.assertEqual(w.readframes(2), b'\x00\x00\xff\x3f\xff\x7f\x01\xc0')
+
+    def test_fade_file_carries_on_then_fades_away(self):
+        with tempfile.TemporaryDirectory() as directory:
+            seconds, bar = music.bar_file(LIBRARY, SHEET, 0, 2, 0.3, directory)
+            path = os.path.join(directory, 'fade.wav')
+            music.fade_file([(-0.5, bar), (seconds - 0.5, bar),
+                             (0.0, os.path.join(directory, 'gone.wav'))], 3.0, 1.0, path)
+            with wave.open(path) as w:
+                self.assertEqual(w.getnframes(), 3 * music.RATE)
+                frames = w.readframes(w.getnframes())
+            pcm = array('h', frames)
+            loudest = max(map(abs, pcm[:2 * music.RATE]))
+            self.assertGreater(loudest, 0)
+            self.assertEqual(max(map(abs, pcm[-200:])), 0)  # faded all the way out
 
 
 if __name__ == '__main__':
