@@ -372,11 +372,49 @@ class PluginTest(TestCase):
         band.cursor = 8
         self.assertEqual(band.next_bar()[:2], (['a1', 'a2'], 0))  # and around again
 
-    def test_quitting_fades_out_what_the_band_is_playing(self):
+    def test_closing_the_last_window_fades_out_at_once(self):
+        faded = []
+        self.conductor.bar = lambda sheet, cursor, stage: (2.0, 'bar-{}.wav'.format(cursor))
+        self.conductor.hear(report(1.0))
+        self.conductor.follow('a.py', score.read('a = 1\n' * 20), None)
+        band = self.conductor.band = self.plugin.Band(self.conductor)
+        band.player = mock.Mock(fades=True)
+        band.player.fade.side_effect = lambda *args: faded.append((time.monotonic(),) + args)
+        self.addCleanup(setattr, self.conductor, 'band', None)
+        self.addCleanup(band.stop)
+        band.start()
+        self.wait_for(lambda: band.upcoming is not None)
+        closed = time.monotonic()
+        self.conductor.silence()
+        self.wait_for(lambda: faded)
+        when, seconds, (delay, path) = faded[0]
+        self.assertLess(when - closed, 0.1)  # not at the end of the bar
+        self.assertEqual(seconds, self.plugin.FADE_SECONDS)
+        self.assertEqual(path, 'bar-8.wav')  # coming in on time, fading with the rest
+        self.assertAlmostEqual(delay, 2.0 - (when - closed), delta=0.1)
+        band.player.play.assert_called_once_with('bar-0.wav')
+        self.plugin.SynestheteListener().on_exit()  # quitting leaves the fade be
+        self.assertEqual(faded[1][1:], (self.plugin.FADE_SECONDS, None))
+        band.player.stop.assert_not_called()
+        band.player.finish.assert_not_called()
+
+    def test_quitting_fades_out_at_once(self):
+        band = self.conductor.band = self.plugin.Band(self.conductor)
+        self.addCleanup(setattr, self.conductor, 'band', None)
+        band.upcoming = (time.monotonic() + 1, 'next.wav')
+        band.player = mock.Mock(fades=True)
+        self.plugin.SynestheteListener().on_exit()
+        seconds, (delay, path) = band.player.fade.call_args[0]
+        self.assertEqual((seconds, path), (self.plugin.FADE_SECONDS, 'next.wav'))
+        self.assertAlmostEqual(delay, 1, places=1)
+        band.player.stop.assert_not_called()  # nothing is cut off
+        self.assertTrue(band.stopped.is_set())
+
+    def test_quitting_where_sounds_cant_fade_fades_the_next_bar(self):
         band = self.plugin.Band(self.conductor)
         self.conductor.band = band
         band.upcoming = (time.monotonic() + 1, 'next.wav')
-        band.player = mock.Mock()
+        band.player = mock.Mock(fades=False)
         with mock.patch.object(self.plugin.music, 'fade_file') as fade_file:
             self.plugin.SynestheteListener().on_exit()
         path, start, hold = fade_file.call_args[0][:3]
@@ -388,17 +426,17 @@ class PluginTest(TestCase):
         self.assertTrue(band.stopped.is_set())
         self.conductor.band = None
 
-    def test_falling_silent_fades_out_like_quitting(self):
+    def test_falling_silent_where_sounds_cant_fade_fades_the_next_bar(self):
         played = []
         self.conductor.bar = lambda sheet, cursor, stage: (0.3, 'bar-{}.wav'.format(cursor))
         self.conductor.hear(report(1.0))
         self.conductor.follow('a.py', score.read('a = 1\n' * 20), None)
         band = self.conductor.band = self.plugin.Band(self.conductor)
-        band.player = mock.Mock(play=lambda path: played.append((time.monotonic(), path)))
+        band.player = mock.Mock(fades=False,
+                                play=lambda path: played.append((time.monotonic(), path)))
         self.addCleanup(setattr, self.conductor, 'band', None)
         self.addCleanup(band.stop)
-        with mock.patch.object(self.plugin.music, 'fade_file') as fade_file, \
-                mock.patch.object(self.plugin, 'EARLY_BAR_GAP', 0.05):  # bars here are short
+        with mock.patch.object(self.plugin.music, 'fade_file') as fade_file:
             band.start()
             self.wait_for(lambda: band.upcoming is not None)
             self.conductor.silence()  # the last window closed
@@ -411,9 +449,9 @@ class PluginTest(TestCase):
         self.assertEqual(fade_file.call_count, 1)  # nothing left over to play on quitting
         band.player.finish.assert_not_called()
 
-    def test_music_heard_again_before_the_fade_plays_on(self):
+    def test_music_heard_again_before_the_next_bar_plays_on(self):
         band = self.plugin.Band(self.conductor)
-        band.player = mock.Mock()
+        band.player = mock.Mock(fades=False)
         band.upcoming = (time.monotonic() + 5, 'next.wav')
         with mock.patch.object(self.plugin.music, 'fade_file'):
             ringing = threading.Thread(target=band.ring_out)

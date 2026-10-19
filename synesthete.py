@@ -37,7 +37,8 @@ PANEL = 'synesthete'
 SOUND_VERSION = 3  # bump when the music changes, so stale renders are dropped
 ACCENT_GAP = 0.12  # seconds between accents, so a burst of changes cascades
 EARLY_BAR_GAP = 0.8  # when the stage changes, wait at least this long after the last bar
-FADE_HOLD, FADE_SECONDS = 1.5, 3.0  # when the music ends, it carries on this long, then fades out
+FADE_SECONDS = 4.5  # when the music ends, it fades out over this long, from that moment on
+FADE_HOLD = 1.5  # where sounds can't fade once started, the next bar is held this long first
 BRANCHES = ('keyword.control.conditional, keyword.control.loop, '
             'keyword.control.exception.catch, keyword.operator.logical')
 NOT_DECISIONS = {'else', 'in', 'is', 'not', '!', 'of', 'then', 'do'}  # see decisions()
@@ -232,7 +233,7 @@ class Conductor:
         self.watchers = {}  # window id -> (watcher, folders), for every project window
         self.window_id = None  # the project window being heard, if any
         self.closing = set()  # ids of windows that are closing
-        self.accent_player = Player()
+        self.accent_player = Player(FADE_SECONDS)
         self.accents = ThreadPoolExecutor(max_workers=1)
         self.renderer = ThreadPoolExecutor(max_workers=1)
         self.warmer = ThreadPoolExecutor(max_workers=1)
@@ -351,13 +352,13 @@ class Conductor:
         return [w for w in windows if w is not None and w.id() not in self.closing]
 
     def silence(self):
-        """Fall silent gracefully: no new bars, but the band rings out."""
+        """Fall silent gracefully: no new bars, and the band fades out."""
         with self.lock:
             self.report = self.sheet = self.playing = None
             self.project = {}
         self.window_id = None
         if self.band is not None:
-            self.band.hurry()  # so it has the fade ready before the next bar is due
+            self.band.hurry()  # so it fades out now
         for window in sublime.windows():
             for view in window.views():
                 view.erase_status(STATUS_KEY)
@@ -636,7 +637,7 @@ class Band(threading.Thread):
     def __init__(self, conductor):
         super().__init__(name='Synesthete band', daemon=True)
         self.conductor = conductor
-        self.player = Player()
+        self.player = Player(FADE_SECONDS)
         self.stopped = threading.Event()
         self.woken = threading.Event()
         self.cursor = 0
@@ -659,20 +660,33 @@ class Band(threading.Thread):
             upcoming, self.upcoming = self.upcoming, None
         return upcoming
 
+    def fade_away(self):
+        """Fade out everything from now on, with the next bar coming in on
+        time as it fades. Sounds fading already carry on as they were."""
+        upcoming = self.take_upcoming()
+        if upcoming is not None:
+            when, path = upcoming
+            upcoming = (max(0.0, when - time.monotonic()), path)
+        self.player.fade(FADE_SECONDS, upcoming)
+
     def fade_out(self):
         """Sublime is quitting: rather than stopping wherever the bar ends,
-        let it play out and the next one carry on, fading away. Nothing is
-        cut off, so there's no break."""
+        fade away, the same as when the last window closes. If that's under
+        way, quitting leaves it be. Where sounds can't fade once started (see
+        Player.fades), the bar plays out and the next one fades instead."""
         self.stopped.set()
         self.woken.set()
         self.rendered.wait(1.0)
+        if self.player.fades:
+            self.fade_away()
+            return
         upcoming = self.take_upcoming()
         if upcoming is None:
             return  # the band already rang out
         when, path = upcoming
         start = when - time.monotonic()
         try:
-            music.fade_file(path, start, max(0.0, FADE_HOLD - start), FADE_SECONDS,
+            music.fade_file(path, start, max(0.0, FADE_HOLD - start), FADE_SECONDS - FADE_HOLD,
                             self.fade_path)
             self.player.finish(self.fade_path)
         except Exception as e:
@@ -680,16 +694,20 @@ class Band(threading.Thread):
 
     def ring_out(self):
         """Nothing is left to hear, as when the last window closes: rather
-        than stopping where the bar ends, play the next one on time, fading
-        away, as on quitting. If something is heard again before it's due,
-        the band carries on instead."""
+        than stopping where the bar ends, fade away at once. Where sounds
+        can't fade once started, play the next bar on time, fading, as on
+        quitting; and if something is heard again before it's due, the band
+        carries on instead."""
+        if self.player.fades:
+            self.fade_away()
+            return
         upcoming = self.upcoming
         if upcoming is None:
             return
         when, path = upcoming
         try:
             music.fade_file(path, 0.0, max(0.0, FADE_HOLD - (when - time.monotonic())),
-                            FADE_SECONDS, self.ring_path)
+                            FADE_SECONDS - FADE_HOLD, self.ring_path)
         except Exception as e:
             self.upcoming = None
             report_failure(e)
@@ -757,7 +775,8 @@ class Band(threading.Thread):
                 self.stopped.wait(30)
                 continue
             remaining = started + seconds - time.monotonic()
-            if self.woken.wait(max(0.0, remaining)) and not self.stopped.is_set():
+            woken = self.woken.wait(max(0.0, remaining))
+            if woken and not self.stopped.is_set() and self.conductor.report is not None:
                 self.stopped.wait(max(0.0, EARLY_BAR_GAP - (time.monotonic() - started)))
 
 
