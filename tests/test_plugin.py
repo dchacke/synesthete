@@ -4,6 +4,7 @@ import importlib
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -227,7 +228,16 @@ def report(health):
     return analysis.Report(health=health, quality=health, lines=10)
 
 
-class PluginTest(unittest.TestCase):
+class TestCase(unittest.TestCase):
+    def wait_for(self, condition):
+        for _ in range(200):
+            if condition():
+                return
+            time.sleep(0.01)
+        self.fail('timed out')
+
+
+class PluginTest(TestCase):
     def setUp(self):
         self.sublime = SUBLIME
         self.sublime.settings.clear()
@@ -319,6 +329,7 @@ class PluginTest(unittest.TestCase):
         self.sublime.settings['mode'] = 'ambient'
         with mock.patch.object(self.plugin, 'Band') as band:
             self.conductor.configure()
+            band.return_value.hurry.reset_mock()  # nothing's open, so it fell silent
             self.conductor.hear(report(1.0))  # wakes the waiting band
             self.conductor.hear(report(0.95))  # same stage: keep playing
             self.conductor.hear(report(0.1))
@@ -376,6 +387,43 @@ class PluginTest(unittest.TestCase):
         band.player.stop.assert_not_called()  # nothing is cut off
         self.assertTrue(band.stopped.is_set())
         self.conductor.band = None
+
+    def test_falling_silent_fades_out_like_quitting(self):
+        played = []
+        self.conductor.bar = lambda sheet, cursor, stage: (0.3, 'bar-{}.wav'.format(cursor))
+        self.conductor.hear(report(1.0))
+        self.conductor.follow('a.py', score.read('a = 1\n' * 20), None)
+        band = self.conductor.band = self.plugin.Band(self.conductor)
+        band.player = mock.Mock(play=lambda path: played.append((time.monotonic(), path)))
+        self.addCleanup(setattr, self.conductor, 'band', None)
+        self.addCleanup(band.stop)
+        with mock.patch.object(self.plugin.music, 'fade_file') as fade_file, \
+                mock.patch.object(self.plugin, 'EARLY_BAR_GAP', 0.05):  # bars here are short
+            band.start()
+            self.wait_for(lambda: band.upcoming is not None)
+            self.conductor.silence()  # the last window closed
+            self.wait_for(lambda: len(played) == 2)
+            band.fade_out()  # and then Sublime quit
+        (began, first), (rang, last) = played
+        self.assertEqual((first, last), ('bar-0.wav', band.ring_path))
+        self.assertAlmostEqual(rang - began, 0.3, delta=0.05)  # on time, like the next bar
+        self.assertEqual(fade_file.call_args_list[0][0][0], 'bar-8.wav')  # rendered ahead
+        self.assertEqual(fade_file.call_count, 1)  # nothing left over to play on quitting
+        band.player.finish.assert_not_called()
+
+    def test_music_heard_again_before_the_fade_plays_on(self):
+        band = self.plugin.Band(self.conductor)
+        band.player = mock.Mock()
+        band.upcoming = (time.monotonic() + 5, 'next.wav')
+        with mock.patch.object(self.plugin.music, 'fade_file'):
+            ringing = threading.Thread(target=band.ring_out)
+            ringing.start()
+            self.conductor.hear(report(1.0))
+            band.hurry()
+            ringing.join(1)
+        self.assertFalse(ringing.is_alive())
+        band.player.play.assert_not_called()
+        self.assertEqual(band.upcoming[1], 'next.wav')  # still to play, as usual
 
     def test_file_mode_goes_back_to_the_top(self):
         view = View('a = 1\n')
@@ -478,7 +526,7 @@ class PluginTest(unittest.TestCase):
         self.assertFalse(command.is_checked('listen_to', 'file'))
 
 
-class ProjectTest(unittest.TestCase):
+class ProjectTest(TestCase):
     def setUp(self):
         SUBLIME.settings.clear()
         SUBLIME.settings.update(enabled=True, mode='chime', listen_to='project', poll_interval=0.02)
@@ -507,13 +555,6 @@ class ProjectTest(unittest.TestCase):
             f.write(text)
         stat = os.stat(self.path)  # make sure the change is visible even on coarse clocks
         os.utime(self.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10 ** 9))
-
-    def wait_for(self, condition):
-        for _ in range(200):
-            if condition():
-                return
-            time.sleep(0.01)
-        self.fail('timed out')
 
     def test_hears_files_change_on_disk(self):
         self.wait_for(lambda: self.conductor.report is not None)

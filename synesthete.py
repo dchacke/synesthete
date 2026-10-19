@@ -37,7 +37,7 @@ PANEL = 'synesthete'
 SOUND_VERSION = 3  # bump when the music changes, so stale renders are dropped
 ACCENT_GAP = 0.12  # seconds between accents, so a burst of changes cascades
 EARLY_BAR_GAP = 0.8  # when the stage changes, wait at least this long after the last bar
-FADE_HOLD, FADE_SECONDS = 1.5, 3.0  # after quitting, the music carries on this long, then fades out
+FADE_HOLD, FADE_SECONDS = 1.5, 3.0  # when the music ends, it carries on this long, then fades out
 BRANCHES = ('keyword.control.conditional, keyword.control.loop, '
             'keyword.control.exception.catch, keyword.operator.logical')
 NOT_DECISIONS = {'else', 'in', 'is', 'not', '!', 'of', 'then', 'do'}  # see decisions()
@@ -351,11 +351,13 @@ class Conductor:
         return [w for w in windows if w is not None and w.id() not in self.closing]
 
     def silence(self):
-        """Fall silent gracefully: no new bars, but the last one rings out."""
+        """Fall silent gracefully: no new bars, but the band rings out."""
         with self.lock:
             self.report = self.sheet = self.playing = None
             self.project = {}
         self.window_id = None
+        if self.band is not None:
+            self.band.hurry()  # so it has the fade ready before the next bar is due
         for window in sublime.windows():
             for view in window.views():
                 view.erase_status(STATUS_KEY)
@@ -638,15 +640,24 @@ class Band(threading.Thread):
         self.stopped = threading.Event()
         self.woken = threading.Event()
         self.cursor = 0
-        self.upcoming = None  # (when, path) of the bar rendered next
+        self.upcoming = None  # (when, path) of the bar rendered next, until it plays
+        self.lock = threading.Lock()  # around taking the upcoming bar to play it
         self.rendered = threading.Event()  # clear while the next bar renders
         self.rendered.set()
         self.fade_path = os.path.join(cache_dir(), 'fade.wav')
+        self.ring_path = os.path.join(cache_dir(), 'ring.wav')
 
     def stop(self):
         self.stopped.set()
         self.woken.set()
         self.player.stop()
+
+    def take_upcoming(self):
+        """The upcoming bar, for whichever plays it: the band ringing out or
+        the fade-out on quitting, but not both."""
+        with self.lock:
+            upcoming, self.upcoming = self.upcoming, None
+        return upcoming
 
     def fade_out(self):
         """Sublime is quitting: rather than stopping wherever the bar ends,
@@ -655,9 +666,10 @@ class Band(threading.Thread):
         self.stopped.set()
         self.woken.set()
         self.rendered.wait(1.0)
-        if self.upcoming is None:
-            return
-        when, path = self.upcoming
+        upcoming = self.take_upcoming()
+        if upcoming is None:
+            return  # the band already rang out
+        when, path = upcoming
         start = when - time.monotonic()
         try:
             music.fade_file(path, start, max(0.0, FADE_HOLD - start), FADE_SECONDS,
@@ -665,6 +677,33 @@ class Band(threading.Thread):
             self.player.finish(self.fade_path)
         except Exception as e:
             print('Synesthete:', e)  # the API is gone, so no status message
+
+    def ring_out(self):
+        """Nothing is left to hear, as when the last window closes: rather
+        than stopping where the bar ends, play the next one on time, fading
+        away, as on quitting. If something is heard again before it's due,
+        the band carries on instead."""
+        upcoming = self.upcoming
+        if upcoming is None:
+            return
+        when, path = upcoming
+        try:
+            music.fade_file(path, 0.0, max(0.0, FADE_HOLD - (when - time.monotonic())),
+                            FADE_SECONDS, self.ring_path)
+        except Exception as e:
+            self.upcoming = None
+            report_failure(e)
+            return
+        while True:
+            self.woken.clear()
+            if self.stopped.is_set() or self.conductor.report is not None:
+                return  # quitting, which fades out on its own, or playing on
+            remaining = when - time.monotonic()
+            if remaining <= 0:
+                break
+            self.woken.wait(remaining)
+        if self.take_upcoming() is not None:
+            self.player.play(self.ring_path)
 
     def hurry(self):
         self.woken.set()
@@ -687,7 +726,10 @@ class Band(threading.Thread):
             self.woken.clear()
             plan = self.next_bar()
             if plan is None:
-                self.woken.wait(0.5)
+                if self.upcoming is not None:
+                    self.ring_out()
+                else:
+                    self.woken.wait(0.5)
                 continue
             try:
                 if ready is None or ready[0] != plan:
@@ -695,18 +737,22 @@ class Band(threading.Thread):
                 if self.next_bar() != plan:
                     ready = None
                     continue  # the code changed while the bar was rendering
+                with self.lock:
+                    if self.stopped.is_set():
+                        break  # quitting, which fades out the bar due now instead
+                    self.rendered.clear()
+                    self.upcoming = None
                 self.player.play(ready[2])
                 started, seconds = time.monotonic(), ready[1]
-                self.upcoming = None
-                self.rendered.clear()
                 self.cursor = plan[1] + music.STEPS
-                upcoming = self.next_bar()
+                # If the music just ended, render what would have come next, to ring out.
+                upcoming = self.next_bar() or (plan[0], self.cursor, plan[2])
                 ready = (upcoming,) + self.conductor.bar(*upcoming)
                 self.upcoming = (started + seconds, ready[2])
                 self.rendered.set()
             except Exception as e:
                 report_failure(e)
-                ready = None
+                ready = self.upcoming = None
                 self.rendered.set()
                 self.stopped.wait(30)
                 continue

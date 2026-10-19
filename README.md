@@ -88,8 +88,8 @@ Switch with `Synesthete: Listen to File` and `Synesthete: Listen to Project`.
 
 Synesthete follows you between windows and files, switching at the end of
 the bar. When the window or file it's playing closes, it moves on to
-whatever is open, and when nothing is, it lets the last bar ring out and
-falls silent.
+whatever is open, and when nothing is, it carries on a moment and fades
+out, as when you quit.
 
 ## The map
 
