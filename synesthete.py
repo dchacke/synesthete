@@ -611,13 +611,14 @@ class Conductor:
         return min(max(settings().get(key, default), 0.0), 1.0)
 
     def warm_up(self):
-        """Render the accents ahead of time, nearest the current stage first,
-        so changes are heard without delay."""
-        current = music.stage(self.report.health) if self.report else 0
+        """Render the current stage's accents ahead of time, so changes are
+        heard without delay. Only those: most accents are made of the lines
+        that changed and render when they happen, and rendering all seven
+        stages would keep Python busy for seconds after every settings change."""
+        stage = music.stage(self.report.health) if self.report else 0
         try:
-            for stage in sorted(range(len(music.STAGES)), key=lambda i: abs(i - current)):
-                for way in ('up', 'down', 'same'):
-                    music.accent_file(library, stage, way, self.volume('volume', 0.5), cache_dir())
+            for way in ('up', 'down', 'same'):
+                music.accent_file(library, stage, way, self.volume('volume', 0.5), cache_dir())
         except Exception as e:
             report_failure(e)
 
