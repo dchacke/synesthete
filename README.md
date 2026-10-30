@@ -153,8 +153,8 @@ Then run `Synesthete: Play All Stages` from the command palette to hear the
 current file in every stage.
 
 Requires Sublime Text 4. Sound is played with `afplay` on macOS and `paplay`,
-`pw-play`, or `aplay` on Linux. On Windows it uses `winsound`, which cannot
-overlap sounds, so each sound cuts off the one before.
+`pw-play`, or `aplay` on Linux. On Windows Synesthete mixes the sounds
+itself and plays them through the default audio device.
 
 ## Usage
 
