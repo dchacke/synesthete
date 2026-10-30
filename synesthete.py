@@ -36,7 +36,7 @@ PACKAGE = os.path.dirname(os.path.abspath(__file__))
 PANEL = 'synesthete'
 SOUND_VERSION = 3  # bump when the music changes, so stale renders are dropped
 ACCENT_GAP = 0.12  # seconds between accents, so a burst of changes cascades
-EARLY_BAR_GAP = 0.8  # when the stage changes, wait at least this long after the last bar
+EARLY_BAR_GAP = 0.8  # when the band is woken early, wait at least this long after the last bar
 FADE_SECONDS = 4.5  # when the music ends, it fades out over this long, from that moment on
 FADE_HOLD = 1.5  # where sounds can't fade once started, the next bar is held this long first
 BRANCHES = ('keyword.control.conditional, keyword.control.loop, '
@@ -492,7 +492,9 @@ class Conductor:
         if previous is not None and music.stage(previous.health) == stage:
             return
         if self.band is not None:
-            self.band.hurry()
+            if previous is None:
+                self.band.hurry()  # it's waiting in silence
+            # Otherwise it hands over to the new stage from the next bar on.
         elif previous is not None and settings().get('enabled', True):
             self.renderer.submit(self.phrase, stage)
 
@@ -602,10 +604,11 @@ class Conductor:
 
         self.accents.submit(job)
 
-    def bar(self, sheet, cursor, stage):
-        """Render a bar of `sheet`. Returns (seconds until the next bar, path)."""
+    def bar(self, sheet, cursor, stage, handover=None):
+        """Render a bar of `sheet`. Returns (seconds until the next bar, path).
+        See music.arrange for `handover`."""
         volume = self.volume('ambient_volume', 0.3)
-        return music.bar_file(library, sheet, cursor, stage, volume, cache_dir())
+        return music.bar_file(library, sheet, cursor, stage, volume, cache_dir(), handover)
 
     def volume(self, key, default):
         return min(max(settings().get(key, default), 0.0), 1.0)
@@ -631,9 +634,10 @@ class Conductor:
 class Band(threading.Thread):
     """The ambient stream: walks through the code a bar at a time in the
     current stage, rendering each bar while the one before it plays, and in
-    project mode on through every file. When the stage changes the next bar
-    starts right away; when the code changes the band moves to where it
-    changed."""
+    project mode on through every file. When the stage changes, the music
+    changes over to it in the next few bars, the new stage's instruments
+    taking over from the old (see music.arrange); when the code changes the
+    band moves to where it changed."""
 
     def __init__(self, conductor):
         super().__init__(name='Synesthete band', daemon=True)
@@ -642,6 +646,8 @@ class Band(threading.Thread):
         self.stopped = threading.Event()
         self.woken = threading.Event()
         self.cursor = 0
+        self.sounding = None  # the stage that led the last bar, if any
+        self.handing = None  # (from stage, to stage, bars played) while changing over
         self.upcoming = None  # (when, path) of the bar rendered next, until it plays
         self.lock = threading.Lock()  # around taking the upcoming bar to play it
         self.rendered = threading.Event()  # clear while the next bar renders
@@ -728,19 +734,46 @@ class Band(threading.Thread):
         self.woken.set()
 
     def next_bar(self):
-        """What to play next: (sheet, cursor, stage), or None for silence."""
+        """What to play next: (sheet, cursor, stage, handover), or None for
+        silence. See music.arrange for handover."""
         c = self.conductor
         if c.report is None:
+            self.sounding = self.handing = None  # the music starts afresh
             return None
         if c.focus is not None:
             self.cursor, c.focus = max(0, c.focus - 2), None  # lead in to the change
         if self.cursor >= len(c.sheet or []):  # the end of this file
             c.advance()
             self.cursor = 0
-        return c.sheet or [], self.cursor, music.stage(c.report.health)
+        stage = music.stage(c.report.health)
+        return c.sheet or [], self.cursor, stage, self.handover(stage)
+
+    def handover(self, stage):
+        """(from stage, how far along) while the music changes over to
+        `stage`, or None once it's there. Should the code take another turn
+        on the way, the music changes over from the stage leading it now."""
+        if self.handing is not None and self.handing[1] == stage:
+            source, _, played = self.handing
+            return source, (played + 1) / (music.HANDOVER_BARS + 1)
+        if self.sounding is None or self.sounding == stage:
+            return None
+        return self.sounding, 1 / (music.HANDOVER_BARS + 1)
+
+    def played(self, plan):
+        """Carry the change over along, now that `plan` has started."""
+        stage, handover = plan[2], plan[3]
+        if handover is None:
+            self.sounding, self.handing = stage, None
+            return
+        source, t = handover
+        played = self.handing[2] if self.handing and self.handing[:2] == (source, stage) else 0
+        self.handing = (source, stage, played + 1)
+        self.sounding = stage if t >= 0.5 else source  # which bass played
+        if played + 1 >= music.HANDOVER_BARS:
+            self.handing = None
 
     def run(self):
-        ready = None  # (sheet, cursor, stage), seconds, path
+        ready = None  # (plan, seconds, path) of the bar rendered next
         while not self.stopped.is_set():
             self.woken.clear()
             plan = self.next_bar()
@@ -764,8 +797,9 @@ class Band(threading.Thread):
                 self.player.play(ready[2])
                 started, seconds = time.monotonic(), ready[1]
                 self.cursor = plan[1] + music.STEPS
+                self.played(plan)
                 # If the music just ended, render what would have come next, to ring out.
-                upcoming = self.next_bar() or (plan[0], self.cursor, plan[2])
+                upcoming = self.next_bar() or (plan[0], self.cursor) + plan[2:]
                 ready = (upcoming,) + self.conductor.bar(*upcoming)
                 self.upcoming = (started + seconds, ready[2])
                 self.rendered.set()

@@ -26,6 +26,7 @@ from .sampler import RATE
 VERSION = 4  # part of every cache key; bump when the music changes
 D3 = 146.83
 STEPS = 8  # lines per bar
+HANDOVER_BARS = 3  # bars in which one stage's music gives way to the next
 MAX_CACHED_BARS = 100  # about 100 MB
 
 # melody, comment and function are (instrument, semitones above D3); bass is
@@ -100,21 +101,47 @@ def _sound(spec, time, velocity, pan=0.0, transpose=0, cents=0.0, seconds=3.0, k
     return Event(time, instrument, freq, None, 1.0, velocity, pan, seconds)
 
 
-def arrange(sheet, cursor, index):
+def arrange(sheet, cursor, index, handover=None):
     """The events of one bar: STEPS lines of `sheet` starting at `cursor`,
-    played in stage `index`, with rests past its end. Returns (events, seconds)."""
+    played in stage `index`, with rests past its end. Returns (events, seconds).
+
+    `handover`, (stage, t), makes it a bar of the music changing over from
+    that stage to this one, `t` of the way (between 0 and 1). The tempo
+    glides from one to the other, and line by line the new stage's
+    instruments take over the melody, more of it the further along, each
+    line always at the same point, while the old stage's play on what's
+    left, quieter and quieter. Halfway, the new stage's bass, and its
+    singing saw if it has one, take over from the old."""
     s = STAGES[index]
     lines = _lines(sheet, cursor)
-    first = next((line.key for line in lines if line), 0)
-    instrument, roots, length, level = s.bass
-    events = [_sound((instrument, roots[first % len(roots)]), 0.0, level, seconds=length)]
+    if handover is None:
+        return _bar(s, lines), STEPS * s.step
+    old, t = STAGES[handover[0]], handover[1]
+    step = old.step + (s.step - old.step) * t
+    old, new = old._replace(step=step), s._replace(step=step)
+    taken = [line is not None and ((line.key >> 10) % 1000) / 1000 < t for line in lines]
+    events = (_bar(old, lines, [not x for x in taken], lead=t < 0.5, loudness=1 - 0.5 * t)
+              + _bar(new, lines, taken, lead=t >= 0.5, loudness=0.5 + 0.5 * t))
+    return events, STEPS * step
+
+
+def _bar(s, lines, plays=None, lead=True, loudness=1.0):
+    """The events of `lines` in stage `s`: the lines it `plays` (all, if not
+    given), and if it's in the `lead`, the bass and the singing saw."""
+    events = []
+    if lead:
+        first = next((line.key for line in lines if line), 0)
+        instrument, roots, length, level = s.bass
+        events.append(_sound((instrument, roots[first % len(roots)]), 0.0, level, seconds=length))
     for k, line in enumerate(lines):
         # Blank lines are rests, and notes thin out as things get worse.
-        if line is not None and line.kind != 'blank' and (line.key % 1000) / 1000 < s.density:
-            events.extend(_line_events(s, k, line))
-    if s.saw:
+        if (line is not None and line.kind != 'blank' and (line.key % 1000) / 1000 < s.density
+                and (plays is None or plays[k])):
+            events.extend(e._replace(velocity=e.velocity * loudness)
+                          for e in _line_events(s, k, line))
+    if lead and s.saw:
         events.extend(_saw(s, lines))
-    return events, STEPS * s.step
+    return events
 
 
 def _line_events(s, k, line):
@@ -328,19 +355,29 @@ def render(library, events, room):
     return left / peak, right / peak
 
 
-def bar_file(library, sheet, cursor, index, volume, directory):
+def bar_file(library, sheet, cursor, index, volume, directory, handover=None):
     """Render a bar to a WAV, cached by what's in it. Returns (seconds until
-    the next bar, path)."""
+    the next bar, path). See arrange for `handover`."""
     lines = _lines(sheet, cursor)
-    digest = hashlib.sha1(repr((VERSION, index, lines, round(volume, 2))).encode()).hexdigest()[:16]
+    digest = hashlib.sha1(repr((VERSION, index, lines, round(volume, 2), handover))
+                          .encode()).hexdigest()[:16]
     path = os.path.join(directory, 'bars', 'bar-{}-{}.wav'.format(index, digest))
-    events, seconds = arrange(lines, 0, index)
+    events, seconds = arrange(lines, 0, index, handover)
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        left, right = render(library, events, STAGES[index].room)
+        left, right = render(library, events, _room(index, handover))
         write_wav(path, left, right, volume)
         _prune(os.path.dirname(path))
     return seconds, path
+
+
+def _room(index, handover):
+    """Stage `index`'s room, or on the way to it, a room between the two."""
+    if handover is None:
+        return STAGES[index].room
+    (wet, size), (old_wet, old_size) = STAGES[index].room, STAGES[handover[0]].room
+    t = handover[1]
+    return old_wet + (wet - old_wet) * t, old_size + (size - old_size) * t
 
 
 def accent_file(library, index, direction, volume, directory, lines=()):

@@ -133,7 +133,8 @@ and `python3 tools/visualizer_demo.py` prints its address too.
 ## Modes
 
 - **ambient** (default): the code played continuously, plus the accents.
-  When the stage changes, the next bar starts right away.
+  When the stage changes, the new stage's instruments take over from the
+  old over the next few bars, while the accent marks the change at once.
 - **chime**: only the accents, and a bar when the stage changes.
 
 ## Install
