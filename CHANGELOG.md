@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 (2026-11-01)
+
+- When the last window closes in ambient mode, the music fades out, the same
+  as when you quit, instead of letting the bar ring out and stopping.
+- On macOS, the fade starts right away instead of with the next bar, and
+  quitting Sublime no longer cuts it off.
+
 ## 0.2.3 (2026-10-18)
 
 - When you quit Sublime in ambient mode, the music no longer stops where
