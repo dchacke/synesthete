@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 (2026-11-01)
+
+- When the stage changes in ambient mode, the new stage’s instruments take
+  over from the old over the next few bars instead of all at once.
+- Synesthete renders its music with numpy, which Package Control installs for
+  you, so it no longer makes typing lag.
+- Starting Synesthete or changing a setting no longer slows Sublime down for
+  seconds.
+- On Windows, sounds overlap instead of cutting each other off.
+
+Thanks to kaste for all of these.
+
 ## 0.2.4 (2026-11-01)
 
 - When the last window closes in ambient mode, the music fades out, the same
