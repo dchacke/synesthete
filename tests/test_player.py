@@ -94,6 +94,46 @@ class MixerTest(unittest.TestCase):
         self.assertEqual(second.stdin.getvalue(), b'play 0 b.wav\n')
 
 
+class WindowsMixer:
+    def __init__(self):
+        self.calls = []
+        self.playing = False
+
+    def play(self, delay, path):
+        self.calls.append(('play', delay, path))
+        self.playing = True
+
+    def fade(self, seconds):
+        self.calls.append(('fade', seconds))
+
+    def stop(self):
+        self.calls.append(('stop',))
+
+
+class WindowsTest(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(player.sys, 'platform', 'win32')
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.player = player.Player(4.5)
+        self.mixer = self.player._windows = WindowsMixer()
+
+    def test_sounds_overlap_and_fade_through_our_own_mixer(self):
+        p = self.player
+        p.play('a.wav')
+        p.play('b.wav')
+        self.assertTrue(p.fade(4.5, (1.25, 'c.wav')))
+        p.stop()
+        self.assertEqual(self.mixer.calls, [
+            ('play', 0, 'a.wav'), ('play', 0, 'b.wav'), ('play', 1.25, 'c.wav'),
+            ('fade', 4.5), ('stop',)])
+        self.assertTrue(p.fades)
+
+    def test_fading_with_nothing_playing(self):
+        self.assertTrue(self.player.fade(4.5))
+        self.assertEqual(self.mixer.calls, [])
+
+
 @unittest.skipUnless(sys.platform == 'darwin' and shutil.which('osascript'), 'macOS only')
 class MixerScriptTest(unittest.TestCase):
     """The real mixer.js. Whether it can be heard isn't checked, so this also

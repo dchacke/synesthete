@@ -133,7 +133,8 @@ and `python3 tools/visualizer_demo.py` prints its address too.
 ## Modes
 
 - **ambient** (default): the code played continuously, plus the accents.
-  When the stage changes, the next bar starts right away.
+  When the stage changes, the new stage's instruments take over from the
+  old over the next few bars, while the accent marks the change at once.
 - **chime**: only the accents, and a bar when the stage changes.
 
 ## Install
@@ -142,7 +143,8 @@ With [Package Control](https://packagecontrol.io): run `Package Control:
 Install Package` and pick `Synesthete`.
 
 By hand: link this folder into Sublime Text's `Packages` folder under the
-name `Synesthete`. On macOS:
+name `Synesthete`, then run `Package Control: Satisfy Libraries` to install
+numpy, which renders the music. On macOS:
 
 ```bash
 ln -s "$PWD" "$HOME/Library/Application Support/Sublime Text/Packages/Synesthete"
@@ -152,8 +154,8 @@ Then run `Synesthete: Play All Stages` from the command palette to hear the
 current file in every stage.
 
 Requires Sublime Text 4. Sound is played with `afplay` on macOS and `paplay`,
-`pw-play`, or `aplay` on Linux. On Windows it uses `winsound`, which cannot
-overlap sounds, so each sound cuts off the one before.
+`pw-play`, or `aplay` on Linux. On Windows Synesthete mixes the sounds
+itself and plays them through the default audio device.
 
 ## Usage
 
@@ -198,6 +200,8 @@ Bindings` and copy the example on the left to your key bindings on the right:
 ```
 
 ## Tests
+
+The tests need numpy:
 
 ```bash
 python3 -m unittest discover -s tests

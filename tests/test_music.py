@@ -71,6 +71,21 @@ class ArrangeTest(unittest.TestCase):
         self.assertLess(abs(x[-1]), 0.01)  # and out again
         self.assertLess(max(map(abs, x)), 1.2)
 
+    def test_a_new_stage_takes_over_line_by_line(self):
+        sheet = score.read('\n'.join('x{} = {}'.format(i, i) for i in range(8)))
+        events = {}
+        for t in (0.25, 0.75):
+            events[t], seconds = music.arrange(sheet, 0, 6, handover=(1, t))
+            steps = [s.step for s in (music.STAGES[1], music.STAGES[6])]
+            self.assertTrue(min(steps) < seconds / music.STEPS < max(steps))  # the tempo glides
+        early, late = ([e.instrument for e in events[t]] for t in (0.25, 0.75))
+        self.assertEqual(('bass_pizz' in early, 'bass_tremolo' in early), (True, False))
+        self.assertEqual(('bass_pizz' in late, 'bass_tremolo' in late), (False, True))
+        self.assertNotIn('saw', early)  # cursed's singing saw comes in with its bass
+        self.assertIn('saw', late)
+        self.assertGreater(early.count('harp'), late.count('harp'))  # good gives way
+        self.assertEqual(music.arrange(sheet, 0, 6, (1, 0.25))[0], events[0.25])
+
     def test_the_end_of_the_code_trails_off_into_rests(self):
         events, _ = music.arrange(SHEET, len(SHEET) - 2, 0)
         self.assertTrue(all(e.time < 2 * music.STAGES[0].step for e in events))

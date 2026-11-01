@@ -5,6 +5,10 @@ The code is the score (see score.py): the stage decides the scale,
 instruments, tempo, timing and room; the lines decide the notes. Bars of
 eight lines are rendered to WAV files and cached by content, so code that
 hasn't changed costs nothing to play again.
+
+Rendering is numpy's work. Sublime runs every plugin of a Python version in
+one process, and a second of pure Python computing there makes the others
+wait for it, which you feel as you type.
 """
 
 import hashlib
@@ -12,16 +16,17 @@ import math
 import os
 import random
 import struct
-import sys
 import tempfile
-from array import array
 from collections import namedtuple
+
+import numpy as np
 
 from .sampler import RATE
 
 VERSION = 4  # part of every cache key; bump when the music changes
 D3 = 146.83
 STEPS = 8  # lines per bar
+HANDOVER_BARS = 3  # bars in which one stage's music gives way to the next
 MAX_CACHED_BARS = 100  # about 100 MB
 
 # melody, comment and function are (instrument, semitones above D3); bass is
@@ -96,21 +101,47 @@ def _sound(spec, time, velocity, pan=0.0, transpose=0, cents=0.0, seconds=3.0, k
     return Event(time, instrument, freq, None, 1.0, velocity, pan, seconds)
 
 
-def arrange(sheet, cursor, index):
+def arrange(sheet, cursor, index, handover=None):
     """The events of one bar: STEPS lines of `sheet` starting at `cursor`,
-    played in stage `index`, with rests past its end. Returns (events, seconds)."""
+    played in stage `index`, with rests past its end. Returns (events, seconds).
+
+    `handover`, (stage, t), makes it a bar of the music changing over from
+    that stage to this one, `t` of the way (between 0 and 1). The tempo
+    glides from one to the other, and line by line the new stage's
+    instruments take over the melody, more of it the further along, each
+    line always at the same point, while the old stage's play on what's
+    left, quieter and quieter. Halfway, the new stage's bass, and its
+    singing saw if it has one, take over from the old."""
     s = STAGES[index]
     lines = _lines(sheet, cursor)
-    first = next((line.key for line in lines if line), 0)
-    instrument, roots, length, level = s.bass
-    events = [_sound((instrument, roots[first % len(roots)]), 0.0, level, seconds=length)]
+    if handover is None:
+        return _bar(s, lines), STEPS * s.step
+    old, t = STAGES[handover[0]], handover[1]
+    step = old.step + (s.step - old.step) * t
+    old, new = old._replace(step=step), s._replace(step=step)
+    taken = [line is not None and ((line.key >> 10) % 1000) / 1000 < t for line in lines]
+    events = (_bar(old, lines, [not x for x in taken], lead=t < 0.5, loudness=1 - 0.5 * t)
+              + _bar(new, lines, taken, lead=t >= 0.5, loudness=0.5 + 0.5 * t))
+    return events, STEPS * step
+
+
+def _bar(s, lines, plays=None, lead=True, loudness=1.0):
+    """The events of `lines` in stage `s`: the lines it `plays` (all, if not
+    given), and if it's in the `lead`, the bass and the singing saw."""
+    events = []
+    if lead:
+        first = next((line.key for line in lines if line), 0)
+        instrument, roots, length, level = s.bass
+        events.append(_sound((instrument, roots[first % len(roots)]), 0.0, level, seconds=length))
     for k, line in enumerate(lines):
         # Blank lines are rests, and notes thin out as things get worse.
-        if line is not None and line.kind != 'blank' and (line.key % 1000) / 1000 < s.density:
-            events.extend(_line_events(s, k, line))
-    if s.saw:
+        if (line is not None and line.kind != 'blank' and (line.key % 1000) / 1000 < s.density
+                and (plays is None or plays[k])):
+            events.extend(e._replace(velocity=e.velocity * loudness)
+                          for e in _line_events(s, k, line))
+    if lead and s.saw:
         events.extend(_saw(s, lines))
-    return events, STEPS * s.step
+    return events
 
 
 def _line_events(s, k, line):
@@ -199,9 +230,7 @@ def singing_saw(points, seconds):
     slightly with the pressure. `points` lists (seconds, Hz) to slide to."""
     rng = random.Random(repr(points))
     n = int(seconds * RATE)
-    out = [0.0] * n
-    sin, cos = math.sin, math.cos
-    phase = 0.0
+    sin = math.sin
     freq = points[0][1]
     target = 0
     since = 0.0  # seconds since the current note began
@@ -209,6 +238,7 @@ def singing_saw(points, seconds):
     wobble = rng.uniform(0, 2 * math.pi)
     level = 0.0
     block = 32
+    incs, steps = [], []  # per block, how far each sample turns the phase and the level
     for start in range(0, n, block):
         t = start / RATE
         while target + 1 < len(points) and t >= points[target + 1][0]:
@@ -225,13 +255,20 @@ def singing_saw(points, seconds):
         dip = 1 - 0.35 * max(0.0, 1 - since / 0.25)  # the bow changing direction
         goal_level = swell * dip * pressure
         step = (goal_level - level) / block
-        inc = 2 * math.pi * bent / RATE
-        for i in range(start, min(start + block, n)):
-            x = sin(phase)
-            out[i] = level * x * (1 + 0.12 * cos(phase) + 0.03 * (3 - 4 * x * x))
-            phase += inc
-            level += step
-    return out
+        incs.append(2 * math.pi * bent / RATE)
+        steps.append(step)
+        level += step * min(block, n - start)
+    # Each sample sounds before its own turn of the phase and level.
+    phase = _before(np.repeat(incs, block)[:n])
+    level = _before(np.repeat(steps, block)[:n])
+    x = np.sin(phase)
+    return level * x * (1 + 0.12 * np.cos(phase) + 0.03 * (3 - 4 * x * x))
+
+
+def _before(increments):
+    """For each sample, the sum of the increments before it."""
+    total = np.cumsum(increments)
+    return np.concatenate(([0.0], total[:-1])) if len(total) else total
 
 
 def mix(library, events, tail):
@@ -246,44 +283,63 @@ def mix(library, events, tail):
         notes.append((int(e.time * RATE), samples, e))
     end = max((start + len(samples) for start, samples, _ in notes), default=0)
     length = end + int(tail * RATE)
-    left, right = [0.0] * length, [0.0] * length
+    left, right = np.zeros(length), np.zeros(length)
     for start, samples, e in notes:
         angle = (e.pan + 1) * math.pi / 4  # constant-power panning
         gl, gr = e.velocity * math.cos(angle), e.velocity * math.sin(angle)
         end = start + len(samples)
-        left[start:end] = [a + gl * b for a, b in zip(left[start:end], samples)]
-        right[start:end] = [a + gr * b for a, b in zip(right[start:end], samples)]
+        left[start:end] += gl * samples
+        right[start:end] += gr * samples
     return left, right
 
 
 def reverb(left, right, wet, size):
     """Schroeder-style: damped combs over the mono sum, then a slightly
     different allpass chain per side for width."""
-    n = len(left)
-    mono = [0.5 * (a + b) for a, b in zip(left, right)]
-    combs = [0.0] * n
+    mono = 0.5 * (left + right)
+    combs = np.zeros(len(left))
     feedback = 0.6 + 0.3 * size
     for ms in (29.7, 37.1, 41.1, 43.7):
-        delay = int(RATE * ms / 1000 * (0.7 + 0.6 * size))
-        y = mono[:]
-        damped = 0.0
-        for i in range(delay, n):
-            damped += 0.45 * (y[i - delay] - damped)
-            y[i] += feedback * damped
-        combs = [a + b for a, b in zip(combs, y)]
+        combs += _comb(mono, int(RATE * ms / 1000 * (0.7 + 0.6 * size)), feedback)
     sides = []
     for offsets in ((5.0, 1.7), (5.6, 2.1)):
         x = combs
         for ms in offsets:
-            delay = int(RATE * ms / 1000)
-            y = x[:]
-            for i in range(delay, n):
-                y[i] = -0.7 * x[i] + x[i - delay] + 0.7 * y[i - delay]
-            x = y
+            x = _allpass(x, int(RATE * ms / 1000))
         sides.append(x)
     scale = wet / 4
-    return ([a + scale * b for a, b in zip(left, sides[0])],
-            [a + scale * b for a, b in zip(right, sides[1])])
+    return left + scale * sides[0], right + scale * sides[1]
+
+
+# The filters below feed back `delay` samples later, so they can't run on a
+# whole signal at once, but they can run on `delay` samples at a time.
+
+DECAY = 0.55 ** np.arange(65)  # how the comb's damping forgets, sample by sample
+DAMPING = 0.45 * DECAY[:64]  # its impulse response; later taps are below a float's precision
+
+
+def _comb(x, delay, feedback):
+    """A comb filter whose feedback is damped, as by the air in a room. The
+    damping is a one-pole lowpass, applied to each block as a convolution
+    with its impulse response, plus what's left of the block before."""
+    y = x.copy()
+    damped = 0.0
+    for start in range(delay, len(x), delay):
+        end = min(start + delay, len(x))
+        d = np.convolve(y[start - delay:end - delay], DAMPING)[:end - start]
+        d[:64] += damped * DECAY[1:min(end - start, 64) + 1]
+        y[start:end] += feedback * d
+        damped = d[-1]
+    return y
+
+
+def _allpass(x, delay):
+    y = x.copy()
+    for start in range(delay, len(x), delay):
+        end = min(start + delay, len(x))
+        y[start:end] = (-0.7 * x[start:end] + x[start - delay:end - delay]
+                        + 0.7 * y[start - delay:end - delay])
+    return y
 
 
 def render(library, events, room):
@@ -292,26 +348,36 @@ def render(library, events, room):
     left, right = mix(library, events, tail=0.5 + 3 * (size - 0.6))
     left, right = reverb(left, right, wet, size)
     fade = min(len(left), int(0.4 * RATE))  # the room's tail ends gently, not with a click
+    ramp = 1 - np.arange(1, fade + 1) / fade
     for side in (left, right):
-        for k in range(fade):
-            side[len(side) - fade + k] *= 1 - (k + 1) / fade
-    peak = max(max(map(abs, left), default=0.0), max(map(abs, right), default=0.0)) or 1.0
-    return [a / peak for a in left], [b / peak for b in right]
+        side[len(side) - fade:] *= ramp
+    peak = max(np.max(np.abs(left), initial=0.0), np.max(np.abs(right), initial=0.0)) or 1.0
+    return left / peak, right / peak
 
 
-def bar_file(library, sheet, cursor, index, volume, directory):
+def bar_file(library, sheet, cursor, index, volume, directory, handover=None):
     """Render a bar to a WAV, cached by what's in it. Returns (seconds until
-    the next bar, path)."""
+    the next bar, path). See arrange for `handover`."""
     lines = _lines(sheet, cursor)
-    digest = hashlib.sha1(repr((VERSION, index, lines, round(volume, 2))).encode()).hexdigest()[:16]
+    digest = hashlib.sha1(repr((VERSION, index, lines, round(volume, 2), handover))
+                          .encode()).hexdigest()[:16]
     path = os.path.join(directory, 'bars', 'bar-{}-{}.wav'.format(index, digest))
-    events, seconds = arrange(lines, 0, index)
+    events, seconds = arrange(lines, 0, index, handover)
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        left, right = render(library, events, STAGES[index].room)
+        left, right = render(library, events, _room(index, handover))
         write_wav(path, left, right, volume)
         _prune(os.path.dirname(path))
     return seconds, path
+
+
+def _room(index, handover):
+    """Stage `index`'s room, or on the way to it, a room between the two."""
+    if handover is None:
+        return STAGES[index].room
+    (wet, size), (old_wet, old_size) = STAGES[index].room, STAGES[handover[0]].room
+    t = handover[1]
+    return old_wet + (wet - old_wet) * t, old_size + (size - old_size) * t
 
 
 def accent_file(library, index, direction, volume, directory, lines=()):
@@ -334,32 +400,26 @@ def fade_file(source, start, hold, seconds, path):
     for `hold` seconds from its start and then fading away over `seconds`."""
     with open(source, 'rb') as f:
         data = f.read()[44:]  # past the header write_wav wrote
-    pcm = array('h')
-    pcm.frombytes(data[:len(data) // 2 * 2])
-    if sys.byteorder == 'big':
-        pcm.byteswap()
+    pcm = np.frombuffer(data[:len(data) // 4 * 4], dtype='<i2')
     begin = int(round(start * RATE))
     held, fading = int(hold * RATE), max(1, int(seconds * RATE))
     first, last = max(0, -begin), min(len(pcm) // 2, held + fading)
     lead = max(0, begin)
-    left = [0.0] * (lead + max(0, last - first))
-    right = list(left)
-    scale = 1 / 32767
-    for k in range(first, last):
-        gain = scale * (1 - max(0, k - held) / fading) ** 2
-        left[lead + k - first] = pcm[2 * k] * gain
-        right[lead + k - first] = pcm[2 * k + 1] * gain
+    left = np.zeros(lead + max(0, last - first))
+    right = left.copy()
+    frames = np.arange(first, last)
+    gain = (1 / 32767) * (1 - np.maximum(0, frames - held) / fading) ** 2
+    left[lead:] = pcm[0::2][first:last] * gain
+    right[lead:] = pcm[1::2][first:last] * gain
     write_wav(path, left, right)
 
 
 def write_wav(path, left, right, volume=1.0):
     """Write 16-bit stereo PCM atomically, so a player never sees half a file."""
     scale = 32767 * min(max(volume, 0.0), 1.0)
-    pcm = array('h', [0]) * (2 * len(left))
-    pcm[0::2] = array('h', (int(s * scale) for s in left))
-    pcm[1::2] = array('h', (int(s * scale) for s in right))
-    if sys.byteorder == 'big':
-        pcm.byteswap()
+    pcm = np.empty(2 * len(left), dtype='<i2')  # little-endian, as WAV wants
+    pcm[0::2] = (np.asarray(left) * scale).astype(np.int16)  # truncated, as int() would
+    pcm[1::2] = (np.asarray(right) * scale).astype(np.int16)
     data = pcm.tobytes()
     header = struct.pack(
         '<4sI4s4sIHHIIHH4sI', b'RIFF', 36 + len(data), b'WAVE', b'fmt ', 16,

@@ -27,15 +27,17 @@ class Player:
     which is how the ambient drone crossfades from one segment to the next.
     On macOS they go through mixer.js, which can also fade them out, and
     fades out whatever is still playing when Sublime quits, over
-    `fade_seconds`. Elsewhere each sound is a process of its own, which
-    plays on after Sublime has quit. On Windows a new sound cuts off the
-    previous one."""
+    `fade_seconds`. On Windows they're mixed into a stream of our own (see
+    winaudio.py), which can fade them out too, and which ends with Sublime.
+    Elsewhere each sound is a process of its own, which plays on after
+    Sublime has quit."""
 
     def __init__(self, fade_seconds=0.0):
         self._command = command()
         self._fade_seconds = fade_seconds
         self._mixing = sys.platform == 'darwin'  # until the mixer won't start
         self._mixer = None
+        self._windows = None  # winaudio.Mixer, once something plays on Windows
         self._processes = []
         self._lock = threading.Lock()
         self._finished = False
@@ -43,7 +45,7 @@ class Player:
     @property
     def fades(self):
         """Whether fade() can fade out sounds that have already started."""
-        return self._mixing
+        return self._mixing or sys.platform == 'win32'
 
     def play(self, path, solo=False):
         """Play `path` in the background. With `solo`, silence everything
@@ -53,9 +55,7 @@ class Player:
         if solo:
             self.stop()
         if sys.platform == 'win32':
-            import winsound
-            flags = winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT
-            winsound.PlaySound(path, flags)
+            self._windows_mixer().play(0, path)
             return
         if self._tell('play 0 {}'.format(path)):
             return
@@ -73,6 +73,8 @@ class Player:
         (delay, path) of a sound to play `delay` seconds from now. Sounds
         that are fading already carry on as they were. Returns whether it
         could; see fades."""
+        if sys.platform == 'win32':
+            return self._fade_on_windows(seconds, due)
         if due is None and self._mixing and (self._mixer is None or self._mixer.poll() is not None):
             return True  # nothing is playing
         lines = ['play {:.4f} {}'.format(*due)] if due else []
@@ -91,8 +93,8 @@ class Player:
 
     def stop(self):
         if sys.platform == 'win32':
-            import winsound
-            winsound.PlaySound(None, 0)
+            if self._windows is not None:
+                self._windows.stop()
             return
         with self._lock:
             mixer, self._mixer = self._mixer, None
@@ -106,6 +108,25 @@ class Player:
         for process in processes:
             if process.poll() is None:
                 process.terminate()
+
+    def _windows_mixer(self):
+        with self._lock:
+            if self._windows is None:
+                from .winaudio import Mixer
+                self._windows = Mixer()
+            return self._windows
+
+    def _fade_on_windows(self, seconds, due):
+        if due is None and (self._windows is None or not self._windows.playing):
+            return True  # nothing is playing
+        try:
+            mixer = self._windows_mixer()
+            if due:
+                mixer.play(*due)
+            mixer.fade(seconds)
+        except OSError:
+            return False
+        return True
 
     def _tell(self, text):
         """Send the mixer `text`, starting it if need be. False if there's

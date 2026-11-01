@@ -3,19 +3,19 @@ recording. The recordings are from VSCO 2 Community Edition (public domain);
 see tools/prepare_samples.py.
 """
 
-import array
 import json
 import math
 import os
 import struct
-import sys
 from collections import OrderedDict
+
+import numpy as np
 
 RATE = 32000
 
 
 def read_wav(path):
-    """16-bit PCM samples of a WAV file as array('h'). Sublime's Python lacks
+    """16-bit PCM samples of a WAV file as numpy int16s. Sublime's Python lacks
     audioop, which the wave module needs, so this reads the chunks itself."""
     with open(path, 'rb') as f:
         data = f.read()
@@ -31,11 +31,7 @@ def read_wav(path):
         elif kind == b'data':
             if (channels, bits) != (1, 16):
                 raise ValueError('expected 16-bit mono: ' + path)
-            pcm = array.array('h')
-            pcm.frombytes(body[:len(body) // 2 * 2])
-            if sys.byteorder == 'big':
-                pcm.byteswap()
-            return pcm
+            return np.frombuffer(body[:len(body) // 2 * 2], dtype='<i2')
         pos += 8 + size + (size & 1)
     raise ValueError('no audio in ' + path)
 
@@ -86,20 +82,15 @@ class Library:
 def resample(pcm, ratio, seconds=None):
     """Play `pcm` `ratio` times faster (higher), as floats, linearly
     interpolated, optionally cut to `seconds` with a 50 ms fade."""
+    pcm = np.asarray(pcm, dtype=float)
     length = int((len(pcm) - 1) / ratio)
     if seconds is not None:
         length = min(length, int(seconds * RATE))
-    scale = 1 / 32768
-    out = [0.0] * length
-    pos = 0.0
-    for i in range(length):
-        j = int(pos)
-        frac = pos - j
-        a = pcm[j]
-        out[i] = (a + (pcm[j + 1] - a) * frac) * scale
-        pos += ratio
+    pos = np.arange(length) * ratio
+    j = pos.astype(int)
+    a = pcm[j]
+    out = (a + (pcm[j + 1] - a) * (pos - j)) * (1 / 32768)
     if seconds is not None and length == int(seconds * RATE):
         fade = min(length, int(0.05 * RATE))
-        for k in range(fade):
-            out[length - fade + k] *= 1 - (k + 1) / fade
+        out[length - fade:] *= 1 - np.arange(1, fade + 1) / fade
     return out

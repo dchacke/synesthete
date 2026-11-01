@@ -325,16 +325,40 @@ class PluginTest(TestCase):
         self.conductor.hear(report(0.5))
         self.assertEqual(self.phrases, [(3,)])
 
-    def test_ambient_mode_hurries_the_band(self):
+    def test_ambient_mode_wakes_the_band_but_lets_it_change_over_in_time(self):
         self.sublime.settings['mode'] = 'ambient'
         with mock.patch.object(self.plugin, 'Band') as band:
             self.conductor.configure()
             band.return_value.hurry.reset_mock()  # nothing's open, so it fell silent
             self.conductor.hear(report(1.0))  # wakes the waiting band
             self.conductor.hear(report(0.95))  # same stage: keep playing
-            self.conductor.hear(report(0.1))
-        self.assertEqual(band.return_value.hurry.call_count, 2)
+            self.conductor.hear(report(0.1))  # the next bars hand over
+        self.assertEqual(band.return_value.hurry.call_count, 1)
         self.assertEqual(self.phrases, [])
+
+    def test_the_band_hands_over_to_a_new_stage_over_a_few_bars(self):
+        self.conductor.hear(report(0.8))
+        self.conductor.follow('a.py', score.read('a = 1\n' * 80), None)
+        band = self.plugin.Band(self.conductor)
+
+        def play():
+            plan = band.next_bar()
+            band.played(plan)
+            band.cursor += 8
+            return plan[2:]
+
+        self.assertEqual(play(), (1, None))
+        self.conductor.hear(report(0.1))
+        self.assertEqual([play() for _ in range(4)],
+                         [(6, (1, 0.25)), (6, (1, 0.5)), (6, (1, 0.75)), (6, None)])
+        self.conductor.hear(report(0.5))
+        self.assertEqual(play(), (3, (6, 0.25)))
+        self.conductor.hear(report(0.8))  # and back again, before cursed gave way
+        self.assertEqual(play(), (1, (6, 0.25)))
+        self.conductor.silence()
+        self.assertIsNone(band.next_bar())
+        self.conductor.hear(report(0.1))
+        self.assertEqual(play(), (6, None))  # after silence, it starts afresh
 
     def test_project_changes_play_one_accent_per_file(self):
         before, after = report(0.9), report(0.5)
@@ -374,7 +398,7 @@ class PluginTest(TestCase):
 
     def test_closing_the_last_window_fades_out_at_once(self):
         faded = []
-        self.conductor.bar = lambda sheet, cursor, stage: (2.0, 'bar-{}.wav'.format(cursor))
+        self.conductor.bar = lambda sheet, cursor, *_: (2.0, 'bar-{}.wav'.format(cursor))
         self.conductor.hear(report(1.0))
         self.conductor.follow('a.py', score.read('a = 1\n' * 20), None)
         band = self.conductor.band = self.plugin.Band(self.conductor)
@@ -428,7 +452,7 @@ class PluginTest(TestCase):
 
     def test_falling_silent_where_sounds_cant_fade_fades_the_next_bar(self):
         played = []
-        self.conductor.bar = lambda sheet, cursor, stage: (0.3, 'bar-{}.wav'.format(cursor))
+        self.conductor.bar = lambda sheet, cursor, *_: (0.3, 'bar-{}.wav'.format(cursor))
         self.conductor.hear(report(1.0))
         self.conductor.follow('a.py', score.read('a = 1\n' * 20), None)
         band = self.conductor.band = self.plugin.Band(self.conductor)
@@ -469,7 +493,7 @@ class PluginTest(TestCase):
         band = self.plugin.Band(self.conductor)
         band.next_bar()
         band.cursor = 8
-        sheet, cursor, _ = band.next_bar()
+        sheet, cursor = band.next_bar()[:2]
         self.assertEqual((sheet, cursor), (self.conductor.sheet, 0))
 
     def test_the_map_shows_files_and_lights_up_changes(self):
